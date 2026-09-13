@@ -45,6 +45,16 @@ bypass this — only needed once.
 For day-to-day development instead of a full rebuild, `cd electron && npm
 run dev` builds the web bundle and launches Electron directly.
 
+## Browser extension
+
+A Chrome/Edge/Brave extension lives in `extension/` — it auto-renders any
+`.md` file you open directly in the browser (local `file://` or a raw
+`http(s)` URL), in place, with the same Preview/Raw toggle. It's a
+separate lightweight implementation (vanilla JS + `marked` +
+`DOMPurify`), not the Expo codebase, since content scripts need to stay
+small and can't pull in a React Native runtime. See
+[`extension/README.md`](extension/README.md) for how to load it.
+
 ## Android (next)
 
 Same codebase, no rewrite needed: `npx expo run:android` locally, or `eas

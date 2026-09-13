@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "SimplyMarkdown Viewer",
+  "version": "1.0.0",
+  "description": "Renders .md files you open directly in the browser as a clean, readable page instead of raw text, with a Raw toggle to see the source.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "file:///*.md",
+        "file:///*.markdown",
+        "http://*/*.md",
+        "http://*/*.markdown",
+        "https://*/*.md",
+        "https://*/*.markdown"
+      ],
+      "js": ["lib/marked.js", "lib/purify.min.js", "content.js"],
+      "css": ["content.css"],
+      "run_at": "document_end"
+    }
+  ]
+}
