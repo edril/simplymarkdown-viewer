@@ -1,0 +1,36 @@
+{
+  "name": "simplymarkdown-viewer-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "build:web": "cd .. && npx expo export --platform web --output-dir electron/dist",
+    "start": "electron .",
+    "dev": "npm run build:web && npm start",
+    "pack:mac": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --dir",
+    "sign:mac": "node sign-adhoc.js",
+    "dmg:mac": "mkdir -p release && hdiutil create -volname \"SimplyMarkdown Viewer\" -srcfolder \"release/mac-arm64/SimplyMarkdown Viewer.app\" -ov -format UDZO \"release/SimplyMarkdown Viewer.dmg\"",
+    "dist:mac": "npm run build:web && npm run pack:mac && npm run sign:mac && npm run dmg:mac"
+  },
+  "devDependencies": {
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.midwaycyber.simplymarkdownviewer",
+    "productName": "SimplyMarkdown Viewer",
+    "files": [
+      "main.js",
+      "dist/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg"
+      ]
+    }
+  }
+}
