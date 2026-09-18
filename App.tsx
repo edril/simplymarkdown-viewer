@@ -1,6 +1,7 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -13,7 +14,8 @@ import {
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import * as DocumentPicker from 'expo-document-picker';
-import * as FileSystem from 'expo-file-system';
+import { File, Paths } from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
 import Markdown from 'react-native-markdown-display';
 
 type Mode = 'preview' | 'edit';
@@ -27,6 +29,7 @@ const lightTheme = {
   accent: '#b5651d',
   accentText: '#ffffff',
   codeBackground: '#f1efe9',
+  danger: '#b3261e',
 };
 
 const darkTheme = {
@@ -38,14 +41,50 @@ const darkTheme = {
   accent: '#e0913f',
   accentText: '#1f1c17',
   codeBackground: '#28251f',
+  danger: '#ff6b60',
 };
+
+const hasFileSystemAccess =
+  Platform.OS === 'web' && typeof window !== 'undefined' && typeof (window as any).showOpenFilePicker === 'function';
+
+const MARKDOWN_PICKER_TYPES = {
+  types: [
+    {
+      description: 'Markdown',
+      accept: { 'text/markdown': ['.md', '.markdown'] },
+    },
+  ],
+};
+
+function isAbortError(e: unknown): boolean {
+  return !!e && typeof e === 'object' && (e as any).name === 'AbortError';
+}
 
 async function readFileAsText(asset: DocumentPicker.DocumentPickerAsset): Promise<string> {
   if (Platform.OS === 'web') {
     const response = await fetch(asset.uri);
     return await response.text();
   }
-  return await FileSystem.readAsStringAsync(asset.uri);
+  return await new File(asset.uri).text();
+}
+
+function writeNativeFile(uri: string, content: string) {
+  const file = new File(uri);
+  file.create({ overwrite: true, intermediates: true });
+  file.write(content);
+  return file;
+}
+
+function downloadAsFile(content: string, fileName: string) {
+  const blob = new Blob([content], { type: 'text/markdown' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 export default function App() {
@@ -54,13 +93,62 @@ export default function App() {
 
   const [fileName, setFileName] = useState<string | null>(null);
   const [content, setContent] = useState<string>('');
+  const [savedContent, setSavedContent] = useState<string>('');
+  const [fileHandle, setFileHandle] = useState<any>(null); // web/electron: FileSystemFileHandle
+  const [nativeUri, setNativeUri] = useState<string | null>(null); // iOS/Android
   const [mode, setMode] = useState<Mode>('preview');
   const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmVisible, setConfirmVisible] = useState(false);
+  const confirmResolveRef = useRef<((discard: boolean) => void) | null>(null);
 
-  const openFile = useCallback(async () => {
+  const hasDocument = fileName !== null;
+  const dirty = content !== savedContent;
+
+  function confirmDiscardIfDirty(): Promise<boolean> {
+    if (!dirty) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      confirmResolveRef.current = resolve;
+      setConfirmVisible(true);
+    });
+  }
+
+  function resolveDiscardPrompt(discard: boolean) {
+    setConfirmVisible(false);
+    confirmResolveRef.current?.(discard);
+    confirmResolveRef.current = null;
+  }
+
+  async function newDocument() {
+    if (!(await confirmDiscardIfDirty())) return;
+    setError(null);
+    setContent('');
+    setSavedContent('');
+    setFileName('Untitled.md');
+    setFileHandle(null);
+    setNativeUri(null);
+    setMode('edit');
+  }
+
+  async function openFile() {
+    if (!(await confirmDiscardIfDirty())) return;
     setError(null);
     try {
+      if (hasFileSystemAccess) {
+        const [handle] = await (window as any).showOpenFilePicker(MARKDOWN_PICKER_TYPES);
+        setLoading(true);
+        const file = await handle.getFile();
+        const text = await file.text();
+        setContent(text);
+        setSavedContent(text);
+        setFileName(file.name);
+        setFileHandle(handle);
+        setNativeUri(null);
+        setMode('preview');
+        return;
+      }
+
       const result = await DocumentPicker.getDocumentAsync({
         type: ['text/markdown', 'text/plain', 'text/x-markdown', '*/*'],
         copyToCacheDirectory: true,
@@ -72,18 +160,87 @@ export default function App() {
       setLoading(true);
       const text = await readFileAsText(asset);
       setContent(text);
+      setSavedContent(text);
       setFileName(asset.name);
+      setFileHandle(null);
+      setNativeUri(Platform.OS === 'web' ? null : asset.uri);
       setMode('preview');
     } catch (e) {
-      setError('Could not open that file.');
+      if (!isAbortError(e)) setError('Could not open that file.');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }
 
-  const markdownStyles = useMemo(() => buildMarkdownStyles(theme), [theme]);
+  async function saveFile() {
+    setError(null);
+    setSaving(true);
+    try {
+      if (hasFileSystemAccess) {
+        if (fileHandle) {
+          const writable = await fileHandle.createWritable();
+          await writable.write(content);
+          await writable.close();
+        } else {
+          const handle = await (window as any).showSaveFilePicker({
+            suggestedName: fileName || 'Untitled.md',
+            ...MARKDOWN_PICKER_TYPES,
+          });
+          const writable = await handle.createWritable();
+          await writable.write(content);
+          await writable.close();
+          setFileHandle(handle);
+          setFileName(handle.name);
+        }
+        setSavedContent(content);
+      } else if (Platform.OS === 'web') {
+        downloadAsFile(content, fileName || 'Untitled.md');
+        setSavedContent(content);
+      } else if (nativeUri) {
+        writeNativeFile(nativeUri, content);
+        setSavedContent(content);
+      } else {
+        const file = new File(Paths.document, fileName || 'Untitled.md');
+        file.create({ overwrite: true });
+        file.write(content);
+        setNativeUri(file.uri);
+        setSavedContent(content);
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(file.uri);
+        }
+      }
+    } catch (e) {
+      if (!isAbortError(e)) setError('Could not save the file.');
+    } finally {
+      setSaving(false);
+    }
+  }
 
-  const hasDocument = fileName !== null;
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') return;
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        if (hasDocument) saveFile();
+      }
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  });
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+    const handler = (e: BeforeUnloadEvent) => {
+      if (dirty) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [dirty]);
+
+  const markdownStyles = buildMarkdownStyles(theme);
 
   return (
     <SafeAreaProvider>
@@ -92,11 +249,14 @@ export default function App() {
 
         <View style={[styles.header, { borderBottomColor: theme.border, backgroundColor: theme.surface }]}>
           <View style={styles.headerLeft}>
-            <Text style={[styles.title, { color: theme.text }]} numberOfLines={1}>
-              {fileName ?? 'SimplyMarkdown Viewer'}
-            </Text>
+            <View style={styles.titleRow}>
+              <Text style={[styles.title, { color: theme.text }]} numberOfLines={1}>
+                {fileName ?? 'SimplyMarkdown Viewer'}
+              </Text>
+              {dirty && <View style={[styles.dirtyDot, { backgroundColor: theme.accent }]} />}
+            </View>
             {!hasDocument && (
-              <Text style={[styles.subtitle, { color: theme.muted }]}>Open a .md file to get started</Text>
+              <Text style={[styles.subtitle, { color: theme.muted }]}>Open or create a .md file to get started</Text>
             )}
           </View>
 
@@ -110,7 +270,7 @@ export default function App() {
                   theme={theme}
                 />
                 <SegmentButton
-                  label="Raw"
+                  label="Edit"
                   active={mode === 'edit'}
                   onPress={() => setMode('edit')}
                   theme={theme}
@@ -118,14 +278,39 @@ export default function App() {
               </View>
             )}
             <Pressable
-              onPress={openFile}
+              onPress={newDocument}
               style={({ pressed }) => [
-                styles.openButton,
-                { backgroundColor: theme.accent, opacity: pressed ? 0.85 : 1 },
+                styles.secondaryButton,
+                { borderColor: theme.border, opacity: pressed ? 0.7 : 1 },
               ]}
             >
-              <Text style={[styles.openButtonText, { color: theme.accentText }]}>Open…</Text>
+              <Text style={[styles.secondaryButtonText, { color: theme.text }]}>New</Text>
             </Pressable>
+            <Pressable
+              onPress={openFile}
+              style={({ pressed }) => [
+                styles.secondaryButton,
+                { borderColor: theme.border, opacity: pressed ? 0.7 : 1 },
+              ]}
+            >
+              <Text style={[styles.secondaryButtonText, { color: theme.text }]}>Open…</Text>
+            </Pressable>
+            {hasDocument && (
+              <Pressable
+                onPress={saveFile}
+                disabled={saving}
+                style={({ pressed }) => [
+                  styles.primaryButton,
+                  { backgroundColor: theme.accent, opacity: pressed || saving ? 0.85 : 1 },
+                ]}
+              >
+                {saving ? (
+                  <ActivityIndicator color={theme.accentText} size="small" />
+                ) : (
+                  <Text style={[styles.primaryButtonText, { color: theme.accentText }]}>Save</Text>
+                )}
+              </Pressable>
+            )}
           </View>
         </View>
 
@@ -144,17 +329,22 @@ export default function App() {
             <Text style={[styles.emptyIcon]}>📄</Text>
             <Text style={[styles.emptyTitle, { color: theme.text }]}>No document open</Text>
             <Text style={[styles.emptyBody, { color: theme.muted }]}>
-              Choose a Markdown file to view it in a clean, readable preview.
+              Open an existing Markdown file, or start a new one.
             </Text>
-            <Pressable
-              onPress={openFile}
-              style={({ pressed }) => [
-                styles.emptyButton,
-                { backgroundColor: theme.accent, opacity: pressed ? 0.85 : 1 },
-              ]}
-            >
-              <Text style={[styles.openButtonText, { color: theme.accentText }]}>Open Markdown File</Text>
-            </Pressable>
+            <View style={styles.emptyActions}>
+              <Pressable
+                onPress={openFile}
+                style={({ pressed }) => [
+                  styles.emptyButton,
+                  { backgroundColor: theme.accent, opacity: pressed ? 0.85 : 1 },
+                ]}
+              >
+                <Text style={[styles.primaryButtonText, { color: theme.accentText }]}>Open Markdown File</Text>
+              </Pressable>
+              <Pressable onPress={newDocument} style={({ pressed }) => [{ opacity: pressed ? 0.7 : 1 }]}>
+                <Text style={[styles.newDocLink, { color: theme.accent }]}>New Document</Text>
+              </Pressable>
+            </View>
           </View>
         ) : mode === 'preview' ? (
           <ScrollView
@@ -162,7 +352,11 @@ export default function App() {
             contentContainerStyle={styles.previewContent}
             showsVerticalScrollIndicator={false}
           >
-            <Markdown style={markdownStyles}>{content}</Markdown>
+            {content.length === 0 ? (
+              <Text style={{ color: theme.muted, fontSize: 15 }}>Nothing to preview yet — switch to Edit to start writing.</Text>
+            ) : (
+              <Markdown style={markdownStyles}>{content}</Markdown>
+            )}
           </ScrollView>
         ) : (
           <TextInput
@@ -176,8 +370,35 @@ export default function App() {
             autoCorrect={false}
             autoCapitalize="none"
             textAlignVertical="top"
+            placeholder="Start writing…"
+            placeholderTextColor={theme.muted}
           />
         )}
+
+        <Modal visible={confirmVisible} transparent animationType="fade" onRequestClose={() => resolveDiscardPrompt(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={[styles.modalCard, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+              <Text style={[styles.modalTitle, { color: theme.text }]}>Discard unsaved changes?</Text>
+              <Text style={[styles.modalBody, { color: theme.muted }]}>
+                {fileName ?? 'This document'} has unsaved changes that will be lost.
+              </Text>
+              <View style={styles.modalActions}>
+                <Pressable
+                  onPress={() => resolveDiscardPrompt(false)}
+                  style={({ pressed }) => [styles.modalButton, { opacity: pressed ? 0.7 : 1 }]}
+                >
+                  <Text style={[styles.modalButtonText, { color: theme.text }]}>Cancel</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => resolveDiscardPrompt(true)}
+                  style={({ pressed }) => [styles.modalButton, { opacity: pressed ? 0.7 : 1 }]}
+                >
+                  <Text style={[styles.modalButtonText, { color: theme.danger, fontWeight: '700' }]}>Discard</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </Modal>
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -306,11 +527,14 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     borderBottomWidth: StyleSheet.hairlineWidth,
     gap: 12,
+    flexWrap: 'wrap',
   },
-  headerLeft: { flex: 1, minWidth: 0 },
-  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  headerLeft: { flex: 1, minWidth: 120 },
+  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
+  titleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   title: { fontSize: 17, fontWeight: '600' },
   subtitle: { fontSize: 13, marginTop: 2 },
+  dirtyDot: { width: 7, height: 7, borderRadius: 4 },
   segmented: {
     flexDirection: 'row',
     borderWidth: StyleSheet.hairlineWidth,
@@ -320,8 +544,15 @@ const styles = StyleSheet.create({
   },
   segmentButton: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 6 },
   segmentButtonText: { fontSize: 13, fontWeight: '600' },
-  openButton: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: 8 },
-  openButtonText: { fontSize: 14, fontWeight: '600' },
+  secondaryButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  secondaryButtonText: { fontSize: 14, fontWeight: '600' },
+  primaryButton: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: 8, minWidth: 64, alignItems: 'center' },
+  primaryButtonText: { fontSize: 14, fontWeight: '600' },
   body: { flex: 1 },
   previewContent: { paddingHorizontal: 24, paddingVertical: 24, maxWidth: 760, width: '100%', alignSelf: 'center' },
   editor: {
@@ -335,7 +566,16 @@ const styles = StyleSheet.create({
   emptyIcon: { fontSize: 48, marginBottom: 8 },
   emptyTitle: { fontSize: 20, fontWeight: '700' },
   emptyBody: { fontSize: 14, textAlign: 'center', maxWidth: 320, marginBottom: 16 },
+  emptyActions: { alignItems: 'center', gap: 14 },
   emptyButton: { paddingHorizontal: 20, paddingVertical: 12, borderRadius: 10 },
+  newDocLink: { fontSize: 14, fontWeight: '600' },
   errorBanner: { backgroundColor: '#fdecea', padding: 10, alignItems: 'center' },
   errorText: { color: '#b3261e', fontSize: 13 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', alignItems: 'center', justifyContent: 'center', padding: 24 },
+  modalCard: { width: '100%', maxWidth: 360, borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, padding: 20 },
+  modalTitle: { fontSize: 16, fontWeight: '700', marginBottom: 8 },
+  modalBody: { fontSize: 14, lineHeight: 20, marginBottom: 20 },
+  modalActions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 20 },
+  modalButton: { paddingVertical: 6, paddingHorizontal: 4 },
+  modalButtonText: { fontSize: 14, fontWeight: '600' },
 });

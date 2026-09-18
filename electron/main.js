@@ -19,7 +19,6 @@ process.on('unhandledRejection', (reason) => {
 });
 
 const DIST_DIR = path.join(__dirname, 'dist');
-const PORT = 47821;
 
 const MIME_TYPES = {
   '.html': 'text/html',
@@ -63,7 +62,7 @@ function startServer() {
         res.end(data);
       });
     });
-    server.listen(PORT, '127.0.0.1', () => resolve(server));
+    server.listen(0, '127.0.0.1', () => resolve(server));
     server.on('error', reject);
   });
 }
@@ -80,8 +79,10 @@ async function createWindow() {
     return;
   }
 
+  let port;
   try {
-    await startServer();
+    const server = await startServer();
+    port = server.address().port;
   } catch (err) {
     logToFile(`server failed to start: ${err.stack || err}`);
     dialog.showErrorBox('Server error', String((err && err.stack) || err));
@@ -109,7 +110,7 @@ async function createWindow() {
     logToFile(`render-process-gone: ${JSON.stringify(details)}`);
   });
 
-  mainWindow.loadURL(`http://127.0.0.1:${PORT}/`);
+  mainWindow.loadURL(`http://127.0.0.1:${port}/`);
 }
 
 app.whenReady().then(createWindow);
