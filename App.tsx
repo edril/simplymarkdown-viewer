@@ -17,6 +17,8 @@ import * as DocumentPicker from 'expo-document-picker';
 import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import Markdown from 'react-native-markdown-display';
+import { marked } from 'marked';
+import { toBlob } from 'html-to-image';
 
 type Mode = 'preview' | 'edit';
 
@@ -75,8 +77,7 @@ function writeNativeFile(uri: string, content: string) {
   return file;
 }
 
-function downloadAsFile(content: string, fileName: string) {
-  const blob = new Blob([content], { type: 'text/markdown' });
+function downloadBlob(blob: Blob, fileName: string) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -85,6 +86,76 @@ function downloadAsFile(content: string, fileName: string) {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+function downloadTextFile(content: string, fileName: string, mime: string) {
+  downloadBlob(new Blob([content], { type: mime }), fileName);
+}
+
+function baseNameFor(fileName: string | null): string {
+  return (fileName || 'Untitled').replace(/\.(md|markdown)$/i, '');
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+}
+
+// Styling for exported HTML/PNG documents: always light, so the output looks
+// right regardless of the app's current theme or where it ends up (chat,
+// forum, docs site, printed).
+const EXPORT_CSS = `
+  .md-export { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background: #faf9f7; color: #1f1c17; font-size: 17px; line-height: 1.6; padding: 32px; box-sizing: border-box; }
+  .md-export h1, .md-export h2, .md-export h3, .md-export h4, .md-export h5, .md-export h6 { font-weight: 700; line-height: 1.3; }
+  .md-export h1 { font-size: 30px; margin: 8px 0 16px; padding-bottom: 10px; border-bottom: 1px solid #e6e2db; }
+  .md-export h2 { font-size: 24px; margin: 28px 0 12px; }
+  .md-export h3 { font-size: 20px; margin: 22px 0 10px; }
+  .md-export h4, .md-export h5, .md-export h6 { font-size: 16px; margin: 18px 0 8px; }
+  .md-export a { color: #b5651d; text-decoration: underline; }
+  .md-export code { background: #f1efe9; border-radius: 4px; padding: 2px 5px; font-family: Menlo, Consolas, monospace; font-size: 0.9em; }
+  .md-export pre { background: #f1efe9; border-radius: 8px; padding: 14px; overflow: auto; }
+  .md-export pre code { background: none; padding: 0; }
+  .md-export blockquote { background: #ffffff; border-left: 4px solid #b5651d; margin: 12px 0; padding: 8px 14px; border-radius: 4px; }
+  .md-export table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  .md-export th, .md-export td { border: 1px solid #e6e2db; padding: 8px; text-align: left; }
+  .md-export th { background: #ffffff; font-weight: 700; }
+  .md-export img { max-width: 100%; }
+  .md-export hr { border: none; border-top: 1px solid #e6e2db; margin: 24px 0; }
+`;
+
+function buildExportHtml(markdownText: string, title: string): string {
+  const inner = marked.parse(markdownText, { gfm: true, breaks: false }) as string;
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${escapeHtml(title)}</title>
+<style>${EXPORT_CSS}</style>
+</head>
+<body>
+<div class="md-export">${inner}</div>
+</body>
+</html>
+`;
+}
+
+async function renderMarkdownToPngBlob(markdownText: string): Promise<Blob> {
+  const inner = marked.parse(markdownText, { gfm: true, breaks: false }) as string;
+  const container = document.createElement('div');
+  container.style.position = 'fixed';
+  container.style.left = '-99999px';
+  container.style.top = '0';
+  container.style.width = '1000px';
+  container.innerHTML = `<style>${EXPORT_CSS}</style><div class="md-export">${inner}</div>`;
+  document.body.appendChild(container);
+  try {
+    if ((document as any).fonts?.ready) await (document as any).fonts.ready;
+    const node = container.querySelector('.md-export') as HTMLElement;
+    const blob = await toBlob(node, { width: 1000, backgroundColor: '#faf9f7', pixelRatio: 2 });
+    if (!blob) throw new Error('Failed to render image');
+    return blob;
+  } finally {
+    document.body.removeChild(container);
+  }
 }
 
 export default function App() {
@@ -102,6 +173,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [confirmVisible, setConfirmVisible] = useState(false);
   const confirmResolveRef = useRef<((discard: boolean) => void) | null>(null);
+  const [exportMenuVisible, setExportMenuVisible] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   const hasDocument = fileName !== null;
   const dirty = content !== savedContent;
@@ -194,7 +267,7 @@ export default function App() {
         }
         setSavedContent(content);
       } else if (Platform.OS === 'web') {
-        downloadAsFile(content, fileName || 'Untitled.md');
+        downloadTextFile(content, fileName || 'Untitled.md', 'text/markdown');
         setSavedContent(content);
       } else if (nativeUri) {
         writeNativeFile(nativeUri, content);
@@ -213,6 +286,64 @@ export default function App() {
       if (!isAbortError(e)) setError('Could not save the file.');
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function exportHtml() {
+    setExportMenuVisible(false);
+    setError(null);
+    setExporting(true);
+    try {
+      const name = baseNameFor(fileName);
+      const html = buildExportHtml(content, name);
+      const suggested = `${name}.html`;
+      if (hasFileSystemAccess) {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: suggested,
+          types: [{ description: 'HTML', accept: { 'text/html': ['.html'] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(html);
+        await writable.close();
+      } else if (Platform.OS === 'web') {
+        downloadTextFile(html, suggested, 'text/html');
+      } else {
+        const file = new File(Paths.document, suggested);
+        file.create({ overwrite: true });
+        file.write(html);
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(file.uri);
+        }
+      }
+    } catch (e) {
+      if (!isAbortError(e)) setError('Could not export HTML.');
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function exportPng() {
+    setExportMenuVisible(false);
+    setError(null);
+    setExporting(true);
+    try {
+      const blob = await renderMarkdownToPngBlob(content);
+      const suggested = `${baseNameFor(fileName)}.png`;
+      if (hasFileSystemAccess) {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: suggested,
+          types: [{ description: 'PNG Image', accept: { 'image/png': ['.png'] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      } else {
+        downloadBlob(blob, suggested);
+      }
+    } catch (e) {
+      if (!isAbortError(e)) setError('Could not export image.');
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -295,6 +426,22 @@ export default function App() {
             >
               <Text style={[styles.secondaryButtonText, { color: theme.text }]}>Open…</Text>
             </Pressable>
+            {hasDocument && (
+              <Pressable
+                onPress={() => setExportMenuVisible(true)}
+                disabled={exporting}
+                style={({ pressed }) => [
+                  styles.secondaryButton,
+                  { borderColor: theme.border, opacity: pressed || exporting ? 0.7 : 1 },
+                ]}
+              >
+                {exporting ? (
+                  <ActivityIndicator color={theme.text} size="small" />
+                ) : (
+                  <Text style={[styles.secondaryButtonText, { color: theme.text }]}>Export…</Text>
+                )}
+              </Pressable>
+            )}
             {hasDocument && (
               <Pressable
                 onPress={saveFile}
@@ -398,6 +545,45 @@ export default function App() {
               </View>
             </View>
           </View>
+        </Modal>
+
+        <Modal
+          visible={exportMenuVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setExportMenuVisible(false)}
+        >
+          <Pressable style={styles.modalOverlay} onPress={() => setExportMenuVisible(false)}>
+            <Pressable
+              onPress={(e) => e.stopPropagation?.()}
+              style={[styles.modalCard, { backgroundColor: theme.surface, borderColor: theme.border }]}
+            >
+              <Text style={[styles.modalTitle, { color: theme.text }]}>Export</Text>
+              <Text style={[styles.modalBody, { color: theme.muted }]}>
+                Exports always use a clean light document style, regardless of the app's current theme.
+              </Text>
+              <Pressable
+                onPress={exportHtml}
+                style={({ pressed }) => [styles.exportOption, { borderColor: theme.border, opacity: pressed ? 0.7 : 1 }]}
+              >
+                <Text style={[styles.exportOptionText, { color: theme.text }]}>Export as HTML</Text>
+              </Pressable>
+              {Platform.OS === 'web' && (
+                <Pressable
+                  onPress={exportPng}
+                  style={({ pressed }) => [styles.exportOption, { borderColor: theme.border, opacity: pressed ? 0.7 : 1 }]}
+                >
+                  <Text style={[styles.exportOptionText, { color: theme.text }]}>Export as Image (PNG)</Text>
+                </Pressable>
+              )}
+              <Pressable
+                onPress={() => setExportMenuVisible(false)}
+                style={({ pressed }) => [styles.modalButton, { alignSelf: 'flex-end', marginTop: 8, opacity: pressed ? 0.7 : 1 }]}
+              >
+                <Text style={[styles.modalButtonText, { color: theme.muted }]}>Cancel</Text>
+              </Pressable>
+            </Pressable>
+          </Pressable>
         </Modal>
       </SafeAreaView>
     </SafeAreaProvider>
@@ -578,4 +764,12 @@ const styles = StyleSheet.create({
   modalActions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 20 },
   modalButton: { paddingVertical: 6, paddingHorizontal: 4 },
   modalButtonText: { fontSize: 14, fontWeight: '600' },
+  exportOption: {
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    marginTop: 10,
+  },
+  exportOptionText: { fontSize: 14, fontWeight: '600' },
 });

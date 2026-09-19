@@ -65,6 +65,20 @@ codebase, since content scripts need to stay small and can't pull in a
 React Native runtime. See [`extension/README.md`](extension/README.md)
 for how to load it.
 
+## Exporting
+
+The **Export…** button turns the current document into:
+
+- **HTML** — a standalone, self-contained `.html` file with the styling
+  baked in, so it looks right opened in any browser.
+- **Image (PNG)** — a screenshot-style image of the rendered document,
+  1000px wide and as tall as the content needs (nothing gets cropped).
+  Web/Electron only for now (uses `html-to-image` to rasterize a hidden,
+  purpose-built render — not a screenshot of the live app window).
+
+Both always render in a fixed light style regardless of the app's
+current theme, so exports look consistent wherever they end up.
+
 ## Android (next)
 
 Same codebase, no rewrite needed: `npx expo run:android` locally, or `eas
